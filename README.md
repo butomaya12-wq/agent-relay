@@ -29,6 +29,31 @@ hostname `postgres`. PostgreSQL data is persisted in the `relay_postgres_data`
 Docker volume. Stop the stack with `docker compose down`; add `--volumes` only
 when you intentionally want to remove the persisted database.
 
+## Run on a local kind cluster
+
+Build the existing application image, create the local cluster if necessary,
+load the image into kind, and apply the Kubernetes resources:
+
+```bash
+docker build -t agent-relay:kind .
+kind create cluster --name agent-relay
+kind load docker-image agent-relay:kind --name agent-relay
+kubectl apply -k k8s
+kubectl rollout status statefulset/postgres
+kubectl rollout status deployment/agent-relay
+kubectl port-forward service/agent-relay 8000:8000
+```
+
+The `k8s/` configuration creates Services named `agent-relay` and `postgres`.
+The Relay Deployment uses the PostgreSQL Service DNS name in
+`RELAY_DATABASE_URL`; it never targets `localhost`. PostgreSQL runs as a
+single-replica StatefulSet with a persistent volume claim. The local
+credentials are stored in the Kubernetes Secret `agent-relay-postgres`; change
+them before using this configuration outside the homework environment. The
+versioned Secret contains an intentionally non-sensitive local/demo placeholder
+only. Never reuse it for a real deployment; provision a unique credential
+outside source control, preferably through a secret manager.
+
 Register two identities and send a task:
 
 ```bash
@@ -107,5 +132,4 @@ recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
 the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
 running tests against another database.
 
-This project intentionally does not include Kubernetes, CI, external brokers,
-or an LLM.
+This project intentionally does not include CI, external brokers, or an LLM.
