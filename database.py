@@ -1,9 +1,8 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+SQLite-specific connection pragmas and the transaction/row-locking seam live
+here so the storage layer can preserve the relay protocol on either SQLite or
+PostgreSQL.
 """
 
 from __future__ import annotations
@@ -143,6 +142,7 @@ if _is_sqlite(DATABASE_URL):
         engine_kwargs["poolclass"] = StaticPool
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
+POSTGRESQL_ROW_LOCKING = engine.dialect.name == "postgresql"
 
 if _is_sqlite(DATABASE_URL):
 
@@ -177,19 +177,22 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one transaction suitable for coordinated task state changes.
 
     SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
     ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    terminal submissions) across API processes. PostgreSQL uses its normal
+    transaction handling; operations that select task work add row locks via
+    ``FOR UPDATE`` in :mod:`storage`.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            connection.begin()
         yield session
         session.flush()
         connection.commit()
@@ -205,15 +208,45 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
+    if POSTGRESQL_ROW_LOCKING:
+        # Lock the task rows before changing related attempts. Heartbeat,
+        # completion, and claims lock the same task row, so this serializes a
+        # lease recovery race without imposing a global writer lock.
+        expired_tasks = list(
+            db.scalars(
+                select(Task)
+                .join(Attempt)
+                .where(
+                    Task.status == "processing",
+                    Attempt.outcome == "processing",
+                    Attempt.lease_expires_at <= now_db,
+                )
+                .order_by(Attempt.lease_expires_at, Attempt.id)
+                .with_for_update(skip_locked=True)
+            )
         )
-    )
+        expired = [
+            db.scalar(
+                select(Attempt).where(
+                    Attempt.task_id == task.id,
+                    Attempt.outcome == "processing",
+                    Attempt.lease_expires_at <= now_db,
+                )
+            )
+            for task in expired_tasks
+        ]
+    else:
+        expired = list(
+            db.scalars(
+                select(Attempt)
+                .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+                .order_by(Attempt.lease_expires_at, Attempt.id)
+            )
+        )
     count = 0
     for attempt in expired:
+        if attempt is None:
+            continue
         task = db.get(Task, attempt.task_id)
         if task is None or attempt.outcome != "processing":
             continue
@@ -249,6 +282,7 @@ __all__ = [
     "MAX_ATTEMPTS",
     "MAX_BODY_BYTES",
     "MAX_PAGE_SIZE",
+    "POSTGRESQL_ROW_LOCKING",
     "RECOVERY_INTERVAL_SECONDS",
     "Task",
     "as_db_time",
