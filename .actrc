@@ -1,0 +1,6 @@
+--bind
+--network host
+--container-architecture linux/arm64
+--container-daemon-socket unix:///var/run/docker.sock
+--container-options "--add-host=host.docker.internal:host-gateway"
+-P ubuntu-latest=catthehacker/ubuntu:act-latest

@@ -1,0 +1,113 @@
+name: Local CI/CD
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: agent-relay
+  KIND_CLUSTER_NAME: agent-relay
+
+jobs:
+  test:
+    name: Unit and PostgreSQL integration tests
+    runs-on: ubuntu-latest
+    env:
+      UV_PROJECT_ENVIRONMENT: /tmp/agent-relay-venv
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agent_relay_ci
+          POSTGRES_USER: agent_relay_ci
+          POSTGRES_PASSWORD: agent-relay-ci-local-only
+        options: >-
+          --health-cmd "pg_isready -U agent_relay_ci -d agent_relay_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12.5"
+      - name: Install test dependencies
+        run: uv sync --frozen --all-groups
+      - name: Run unit tests
+        env:
+          RELAY_DATABASE_URL: sqlite:////tmp/agent-relay-unit-test.db
+        run: uv run --frozen pytest -q
+      - name: Run PostgreSQL integration tests
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://agent_relay_ci:agent-relay-ci-local-only@127.0.0.1:5432/agent_relay_ci
+        run: uv run --frozen pytest -q
+
+  build-and-deploy:
+    name: Build and deploy to local kind
+    needs: test
+    if: ${{ needs.test.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kind and kubectl
+        shell: bash
+        run: |
+          case "$(uname -m)" in
+            x86_64) architecture=amd64 ;;
+            aarch64|arm64) architecture=arm64 ;;
+            *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl --fail --location --silent --show-error \
+            "https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-${architecture}" \
+            --output /usr/local/bin/kind
+          chmod +x /usr/local/bin/kind
+          curl --fail --location --silent --show-error \
+            "https://dl.k8s.io/release/v1.34.1/bin/linux/${architecture}/kubectl" \
+            --output /usr/local/bin/kubectl
+          chmod +x /usr/local/bin/kubectl
+      - name: Configure access to the local kind cluster
+        shell: bash
+        run: |
+          kubeconfig="$RUNNER_TEMP/kind-config"
+          kind export kubeconfig --name "$KIND_CLUSTER_NAME" --kubeconfig "$kubeconfig"
+          export KUBECONFIG="$kubeconfig"
+          printf 'KUBECONFIG=%s\n' "$kubeconfig" >> "$GITHUB_ENV"
+          kubectl cluster-info
+      - name: Create a unique image tag
+        shell: bash
+        run: |
+          image_tag="ci-${GITHUB_RUN_ID:-local}-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ATTEMPT:-1}"
+          printf 'IMAGE_TAG=%s\n' "$image_tag" >> "$GITHUB_ENV"
+      - name: Build Agent Relay image
+        run: docker build --tag "$IMAGE_NAME:$IMAGE_TAG" .
+      - name: Load image into kind
+        run: kind load docker-image "$IMAGE_NAME:$IMAGE_TAG" --name "$KIND_CLUSTER_NAME"
+      - name: Deploy the tested image and wait for rollout
+        shell: bash
+        run: |
+          kubectl apply -k k8s
+          kubectl set image deployment/agent-relay "agent-relay=$IMAGE_NAME:$IMAGE_TAG"
+          kubectl rollout status statefulset/postgres --timeout=180s
+          kubectl rollout status deployment/agent-relay --timeout=180s
+          deployed_image="$(kubectl get deployment/agent-relay -o jsonpath='{.spec.template.spec.containers[?(@.name=="agent-relay")].image}')"
+          test "$deployed_image" = "$IMAGE_NAME:$IMAGE_TAG"
+      - name: Verify deployed dashboard heading
+        shell: bash
+        run: |
+          local_port=18080
+          kubectl port-forward --address 127.0.0.1 service/agent-relay "${local_port}:8000" >/tmp/agent-relay-port-forward.log 2>&1 &
+          port_forward_pid=$!
+          trap 'kill "$port_forward_pid" 2>/dev/null || true; wait "$port_forward_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl --fail --silent "http://127.0.0.1:${local_port}/" | grep --fixed-strings '<h1>Agent Relay v2</h1>'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/agent-relay-port-forward.log >&2
+          exit 1

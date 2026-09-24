@@ -132,4 +132,6 @@ recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
 the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
 running tests against another database.
 
-This project intentionally does not include CI, external brokers, or an LLM.
+For the local CI/CD workflow used by Homework 3, run `act workflow_dispatch`.
+The `.actrc` configuration gives the workflow container access to the local
+Docker daemon and kind network; it does not store kubeconfig or credentials.

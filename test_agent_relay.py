@@ -156,6 +156,7 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
     with TestClient(main.app) as client:
         page = client.get("/")
         assert page.status_code == 200
+        assert "<h1>Agent Relay v2</h1>" in page.text
         assert "sessionStorage" in page.text
         missing_name = client.post("/api/v1/agents", json={})
         assert missing_name.status_code == 400
